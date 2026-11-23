@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-audio
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipewire
+  namespace: k8s-audio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: pipewire
+
+  template:
+    metadata:
+      labels:
+        app: pipewire
+
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: audio-node # Anpassen
+
+      containers:
+        - name: pipewire
+          image: registry.schidlow.ski/k8s-audio:${VERSION}
+          imagePullPolicy: Always
+
+          securityContext:
+            privileged: true # Für /dev/snd
+
+          ports:
+            - name: output
+              containerPort: 4713
+              protocol: TCP
+            - name: input
+              containerPort: 4714
+              protocol: TCP
+            - name: both
+              containerPort: 4715
+              protocol: TCP
+
+          env:
+            - name: XDG_RUNTIME_DIR
+              value: /run/pipewire
+            - name: PIPEWIRE_RUNTIME_DIR
+              value: /run/pipewire
+
+          volumeMounts:
+            - name: sound
+              mountPath: /dev/snd
+
+            - name: runtime
+              mountPath: /run/pipewire
+
+      volumes:
+        - name: sound
+          hostPath:
+            path: /dev/snd
+            type: Directory
+
+        - name: runtime
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pipewire
+  namespace: k8s-audio
+spec:
+  type: ClusterIP
+
+  selector:
+    app: pipewire
+
+  ports:
+    - name: output
+      port: 4713
+      targetPort: 4713
+      protocol: TCP
+    - name: input
+      port: 4714
+      targetPort: 4714
+      protocol: TCP
+    - name: both
+      port: 4715
+      targetPort: 4715
+      protocol: TCP
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: inject-pulseaudio
+spec:
+  background: false
+  rules:
+    - name: audio-output
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchLabels:
+                  audio.schidlow.ski/access: output
+      mutate:
+        patchStrategicMerge:
+          spec:
+            containers:
+              - (name): "*"
+                env:
+                  - name: PULSE_SERVER
+                    value: "tcp:pipewire.k8s-audio.svc.cluster.local:4713"
+
+    - name: audio-input
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchLabels:
+                  audio.schidlow.ski/access: input
+      mutate:
+        patchStrategicMerge:
+          spec:
+            containers:
+              - (name): "*"
+                env:
+                  - name: PULSE_SERVER
+                    value: "tcp:pipewire.k8s-audio.svc.cluster.local:4714"
+
+    - name: audio-both
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchLabels:
+                  audio.schidlow.ski/access: both
+      mutate:
+        patchStrategicMerge:
+          spec:
+            containers:
+              - (name): "*"
+                env:
+                  - name: PULSE_SERVER
+                    value: "tcp:pipewire.k8s-audio.svc.cluster.local:4715"
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pipewire-access
+  namespace: k8s-audio
+spec:
+  podSelector:
+    matchLabels:
+      app: pipewire
+
+  policyTypes:
+    - Ingress
+
+  ingress:
+    # Speaker only
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              audio.schidlow.ski/access: output
+      ports:
+        - protocol: TCP
+          port: 4713
+
+    # Microphone only
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              audio.schidlow.ski/access: input
+      ports:
+        - protocol: TCP
+          port: 4714
+
+    # Microphone + Speaker
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              audio.schidlow.ski/access: both
+      ports:
+        - protocol: TCP
+          port: 4715
